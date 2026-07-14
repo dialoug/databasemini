@@ -13,6 +13,7 @@ namespace minidb::mysql {
 
 class MysqlSession;
 
+// MysqlDatabase 对应单个 mysqld：持有 Server catalog、活动事务和引擎实例。
 class MysqlDatabase {
 public:
     MysqlDatabase();
@@ -24,6 +25,7 @@ public:
     std::unique_ptr<MysqlSession> connect();
 
 private:
+    // 具体 Server 层状态放在 PImpl 中，避免引擎注册细节泄漏到公开接口。
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
@@ -33,6 +35,7 @@ private:
     friend class MysqlSession;
 };
 
+// Session 对应 mysqld 内的一个连接执行上下文（真实系统通常由工作线程服务）。
 class MysqlSession {
 public:
     ~MysqlSession();
@@ -50,6 +53,7 @@ private:
     MysqlDatabase* database_;
     std::uint64_t connection_id_;
     std::optional<std::uint64_t> transaction_id_;
+    // InnoDB 默认 REPEATABLE READ 会在事务中复用第一次一致性读视图。
     std::optional<ReadView> consistent_read_view_;
 
     friend class MysqlDatabase;

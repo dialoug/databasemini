@@ -17,11 +17,13 @@ struct Overloaded : Visitors... {
 template <class... Visitors>
 Overloaded(Visitors...) -> Overloaded<Visitors...>;
 
+// Server catalog 只保存逻辑 schema 和负责该表的引擎名称。
 struct TableEntry {
     TableSchema schema;
     std::string engine;
 };
 
+// 类型检查位于 Server SQL 层，而不是各引擎中重复实现。
 QueryResult validate_row(const TableSchema& schema, const Row& row) {
     if (schema.columns.size() != row.size()) {
         return QueryResult::error("列数不匹配：期望 " + std::to_string(schema.columns.size()) +
@@ -52,6 +54,7 @@ std::vector<std::string> column_names(const TableSchema& schema) {
 }  // namespace
 
 struct MysqlDatabase::Impl {
+    // 教学实现用全局锁模拟线程安全；真实 mysqld 会允许更多并行执行。
     std::mutex mutex;
     std::uint64_t next_transaction_id{1};
     std::uint64_t next_connection_id{201};
@@ -60,6 +63,7 @@ struct MysqlDatabase::Impl {
     std::unordered_map<std::string, TableEntry> catalog;
 
     Impl() {
+        // 引擎注册表就是可插拔架构的核心：Server 只认识 StorageEngine 接口。
         engines.emplace("INNODB", make_innodb_engine());
         engines.emplace("MEMORY", make_memory_engine());
     }
@@ -67,6 +71,7 @@ struct MysqlDatabase::Impl {
     std::uint64_t begin_transaction() {
         const auto id = next_transaction_id++;
         active_transactions.insert(id);
+        // 一个 Server 事务可能访问多种引擎，因此生命周期事件广播给全部引擎。
         for (auto& [name, engine] : engines) {
             (void)name;
             engine->begin(id);
@@ -75,6 +80,7 @@ struct MysqlDatabase::Impl {
     }
 
     void commit_transaction(std::uint64_t id) {
+        // 先通知引擎持久化/公开各自的写入，再从 Server 活动集合移除。
         for (auto& [name, engine] : engines) {
             (void)name;
             engine->commit(id);
@@ -83,6 +89,7 @@ struct MysqlDatabase::Impl {
     }
 
     void rollback_transaction(std::uint64_t id) {
+        // InnoDB 会记录 rolled_back；MEMORY 的回调为空，展示非事务表差异。
         for (auto& [name, engine] : engines) {
             (void)name;
             engine->rollback(id);
@@ -91,6 +98,7 @@ struct MysqlDatabase::Impl {
     }
 
     ReadView create_read_view(std::optional<std::uint64_t> self) const {
+        // 捕获当前活动事务集合后保持不变，即可模拟 InnoDB 的一致性读视图。
         ReadView view;
         view.low_limit_id = next_transaction_id;
         view.active_transactions = active_transactions;
@@ -107,6 +115,7 @@ MysqlDatabase::~MysqlDatabase() = default;
 
 std::unique_ptr<MysqlSession> MysqlDatabase::connect() {
     std::lock_guard lock(impl_->mutex);
+    // connection id 只是逻辑标识，不对应固定的 std::thread 或 OS 线程号。
     return std::unique_ptr<MysqlSession>(new MysqlSession(*this, impl_->next_connection_id++));
 }
 
@@ -114,6 +123,7 @@ MysqlSession::MysqlSession(MysqlDatabase& database, std::uint64_t connection_id)
     : database_(&database), connection_id_(connection_id) {}
 
 MysqlSession::~MysqlSession() {
+    // 连接异常结束时自动回滚事务型引擎中的未提交写入。
     if (database_ != nullptr) {
         database_->rollback_on_disconnect(*this);
     }
@@ -122,6 +132,7 @@ MysqlSession::~MysqlSession() {
 QueryResult MysqlSession::execute(const std::string& sql) {
     const auto parsed = parse_sql(sql);
     if (!parsed.ok()) {
+        // 与 PostgreSQL 对照：MySQL 的单条语句失败不会自动毒化整个事务。
         return QueryResult::error(parsed.error);
     }
     return database_->execute(*this, *parsed.statement);
@@ -137,8 +148,10 @@ void MysqlDatabase::rollback_on_disconnect(MysqlSession& session) {
 }
 
 QueryResult MysqlDatabase::execute(MysqlSession& session, const Statement& statement) {
+    // catalog、事务集合和引擎调用在同一临界区完成，保证教学示例结果确定。
     std::lock_guard lock(impl_->mutex);
 
+    // visitor 构成极小的 MySQL Server 执行层，并在需要时调用 handler 接口。
     return std::visit(Overloaded{
         [&](const CreateTableStatement& create) -> QueryResult {
             auto schema = create.schema;
@@ -159,6 +172,7 @@ QueryResult MysqlDatabase::execute(MysqlSession& session, const Statement& state
             const auto engine_name = create.engine.empty() ? std::string("innodb")
                                                            : ascii_lower(create.engine);
             std::string normalized_engine;
+            // 引擎名大小写不敏感，但 catalog 统一保存注册表中的标准名称。
             for (const auto& [name, engine] : impl_->engines) {
                 (void)engine;
                 if (ascii_lower(name) == engine_name) {
@@ -172,6 +186,7 @@ QueryResult MysqlDatabase::execute(MysqlSession& session, const Statement& state
 
             bool implicit_commit = false;
             if (session.transaction_id_) {
+                // MySQL DDL 形成隐式事务边界，先提交此前的 DML。
                 impl_->commit_transaction(*session.transaction_id_);
                 session.transaction_id_.reset();
                 session.consistent_read_view_.reset();
@@ -198,6 +213,7 @@ QueryResult MysqlDatabase::execute(MysqlSession& session, const Statement& state
             }
             const bool autocommit = !session.transaction_id_;
             if (autocommit) {
+                // autocommit 模式下，每条 INSERT 都由 Server 包装成独立事务。
                 session.transaction_id_ = impl_->begin_transaction();
             }
             const auto transaction_id = *session.transaction_id_;
@@ -225,12 +241,13 @@ QueryResult MysqlDatabase::execute(MysqlSession& session, const Statement& state
             }
             ReadView view;
             if (session.transaction_id_) {
-                // InnoDB REPEATABLE READ: reuse the first consistent-read view.
+                // InnoDB 默认 REPEATABLE READ：复用事务中的第一个一致性读视图。
                 if (!session.consistent_read_view_) {
                     session.consistent_read_view_ = impl_->create_read_view(session.transaction_id_);
                 }
                 view = *session.consistent_read_view_;
             } else {
+                // autocommit SELECT 每次创建新视图，因此能看到查询前已经提交的数据。
                 view = impl_->create_read_view(std::nullopt);
             }
             auto rows = impl_->engines.at(table_iterator->second.engine)->select(name, view);

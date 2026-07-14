@@ -11,6 +11,7 @@
 namespace minidb {
 namespace {
 
+// lexer 只区分解析当前 SQL 子集所需的五类 token。
 enum class TokenKind { word, number, string, symbol, end };
 
 struct Token {
@@ -18,10 +19,11 @@ struct Token {
     std::string text;
 };
 
+// Lexer 负责字符级扫描，不判断 CREATE、SELECT 等语句结构。
 class Lexer {
 public:
     explicit Lexer(std::string_view input) : input_(input) {
-        // Some Windows shells prepend UTF-8 BOM bytes when piping text to a native process.
+        // 某些 Windows shell 向原生程序管道输入文本时会在首行添加 UTF-8 BOM。
         if (input_.size() >= 3 &&
             static_cast<unsigned char>(input_[0]) == 0xEF &&
             static_cast<unsigned char>(input_[1]) == 0xBB &&
@@ -32,6 +34,7 @@ public:
 
     std::vector<Token> scan() {
         std::vector<Token> tokens;
+        // 每轮至少消费一个字符，遇到非法字符立即给出位置附近的可读错误。
         while (position_ < input_.size()) {
             const auto character = input_[position_];
             if (std::isspace(static_cast<unsigned char>(character))) {
@@ -58,6 +61,7 @@ public:
 
 private:
     Token scan_word() {
+        // 标识符和关键字都先扫描为 word，是否为关键字由 Parser 再判断。
         const auto start = position_;
         while (position_ < input_.size()) {
             const auto character = input_[position_];
@@ -70,6 +74,7 @@ private:
     }
 
     Token scan_number() {
+        // 负号只有紧跟数字时才被当作整数的一部分。
         const auto start = position_++;
         while (position_ < input_.size() &&
                std::isdigit(static_cast<unsigned char>(input_[position_]))) {
@@ -84,6 +89,7 @@ private:
         while (position_ < input_.size()) {
             const auto character = input_[position_++];
             if (character == '\'') {
+                // SQL 使用两个连续单引号表示字符串中的一个单引号。
                 if (position_ < input_.size() && input_[position_] == '\'') {
                     value.push_back('\'');
                     ++position_;
@@ -100,6 +106,7 @@ private:
     std::size_t position_{0};
 };
 
+// SQL 关键字大小写不敏感；标识符大小写规则由具体数据库执行器决定。
 bool equals_keyword(const std::string& value, std::string_view keyword) {
     if (value.size() != keyword.size()) {
         return false;
@@ -112,11 +119,13 @@ bool equals_keyword(const std::string& value, std::string_view keyword) {
     return true;
 }
 
+// Parser 通过 position_ 在 token 数组中前进，并生成强类型 AST。
 class Parser {
 public:
     explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 
     Statement parse() {
+        // 首个关键字决定后续采用哪条语法分支。
         if (match_keyword("CREATE")) {
             return parse_create();
         }
@@ -171,6 +180,7 @@ public:
 
 private:
     Statement parse_create() {
+        // CREATE TABLE t (id INT, name TEXT) [ENGINE=...]
         expect_keyword("TABLE");
         TableSchema schema;
         schema.name = expect_word("表名");
@@ -199,6 +209,7 @@ private:
     }
 
     Statement parse_insert() {
+        // INSERT INTO t VALUES (...)；本项目暂不支持指定列名。
         expect_keyword("INTO");
         InsertStatement statement;
         statement.table = expect_word("表名");
@@ -225,6 +236,7 @@ private:
     }
 
     Statement parse_select() {
+        // 为突出存储和事务路径，查询语法刻意只支持 SELECT * FROM t。
         expect_symbol("*");
         expect_keyword("FROM");
         SelectStatement statement{expect_word("表名")};
@@ -233,6 +245,7 @@ private:
     }
 
     void finish() {
+        // 分号可选，但分号之后不允许再出现第二条语句。
         match_symbol(";");
         if (peek().kind != TokenKind::end) {
             throw std::runtime_error("语句末尾存在多余内容: " + peek().text);
@@ -290,6 +303,7 @@ private:
 
 ParseResult parse_sql(const std::string& sql) {
     try {
+        // 解析分为 lexer 和 parser 两阶段，异常统一转成调用方可处理的 ParseResult。
         Lexer lexer(sql);
         auto tokens = lexer.scan();
         if (tokens.size() == 1) {

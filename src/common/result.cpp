@@ -9,6 +9,8 @@
 namespace minidb {
 namespace {
 
+// 终端的列宽按“显示单元”计算，而不能直接使用 UTF-8 字节数。
+// 本项目的非 ASCII 输出主要是中文，因此将每个非 ASCII 码点近似按两格处理。
 std::size_t display_width(std::string_view text) {
     std::size_t width = 0;
     for (std::size_t index = 0; index < text.size();) {
@@ -18,8 +20,6 @@ std::size_t display_width(std::string_view text) {
             ++index;
             continue;
         }
-        // The REPL primarily prints Chinese. Treat each non-ASCII UTF-8 code point as
-        // two terminal cells so the educational result tables stay readable.
         std::size_t sequence_length = 1;
         if ((byte & 0xE0) == 0xC0) {
             sequence_length = 2;
@@ -34,6 +34,7 @@ std::size_t display_width(std::string_view text) {
     return width;
 }
 
+// 输出内容后补齐空格，使每一列在中英文混排时仍能基本对齐。
 void append_padded(std::ostringstream& output, const std::string& value, std::size_t width) {
     output << value;
     const auto value_width = display_width(value);
@@ -44,6 +45,7 @@ void append_padded(std::ostringstream& output, const std::string& value, std::si
 
 }  // namespace
 
+// variant 中的整数和字符串采用不同转换方式，visit 在编译期保证覆盖全部类型。
 std::string cell_to_string(const Cell& cell) {
     return std::visit([](const auto& value) -> std::string {
         using Value = std::decay_t<decltype(value)>;
@@ -81,6 +83,7 @@ QueryResult QueryResult::error(std::string message) {
 }
 
 std::string QueryResult::format() const {
+    // 错误和不带结果集的命令无需绘制表格。
     if (!ok) {
         return "ERROR: " + message;
     }
@@ -88,6 +91,7 @@ std::string QueryResult::format() const {
         return message.empty() ? "OK" : message;
     }
 
+    // 先把所有 Cell 转成字符串，同时统计每一列需要的最大显示宽度。
     std::vector<std::vector<std::string>> rendered_rows;
     rendered_rows.reserve(rows.size());
     std::vector<std::size_t> widths;
@@ -107,6 +111,7 @@ std::string QueryResult::format() const {
         rendered_rows.push_back(std::move(rendered));
     }
 
+    // 最后统一绘制边框、表头、数据和命令摘要。
     std::ostringstream output;
     const auto divider = [&]() {
         output << '+';

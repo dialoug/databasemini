@@ -16,10 +16,12 @@
 
 namespace minidb {
 
+// 两个命令行程序共用的逐行 REPL。execute 回调决定语句进入哪一种数据库。
 inline int run_repl(const std::string& banner,
                     const std::string& prompt,
                     const std::function<QueryResult(const std::string&)>& execute) {
 #ifdef _WIN32
+    // Windows 终端默认代码页不一定是 UTF-8，主动设置后中文提示才能稳定显示。
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
 #endif
@@ -30,6 +32,7 @@ inline int run_repl(const std::string& banner,
         if (!std::getline(std::cin, line)) {
             break;
         }
+        // QUIT 由 REPL 本身消费，避免数据库执行器承担终端生命周期管理。
         const auto parsed = parse_sql(line);
         if (parsed.ok() && std::holds_alternative<QuitStatement>(*parsed.statement)) {
             break;
