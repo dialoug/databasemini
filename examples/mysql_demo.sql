@@ -1,0 +1,11 @@
+SHOW ARCHITECTURE;
+SHOW ENGINES;
+CREATE TABLE durable_data (id INT, text TEXT) ENGINE=INNODB;
+CREATE TABLE volatile_cache (id INT, text TEXT) ENGINE=MEMORY;
+BEGIN;
+INSERT INTO durable_data VALUES (1, 'rolled back');
+INSERT INTO volatile_cache VALUES (1, 'survives rollback');
+ROLLBACK;
+SELECT * FROM durable_data;
+SELECT * FROM volatile_cache;
+QUIT;
