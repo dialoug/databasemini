@@ -29,7 +29,7 @@ struct TableSchema {
     std::vector<Column> columns;
 };
 
-// 下列工具函数由两套实现共用，不包含任何数据库特有语义。
+// 下列工具函数主要供两套关系型实现共用，不包含数据库特有语义。
 std::string cell_to_string(const Cell& cell);
 std::string data_type_name(DataType type);
 std::string ascii_lower(std::string text);

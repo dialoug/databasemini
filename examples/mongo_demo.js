@@ -1,0 +1,12 @@
+SHOW ARCHITECTURE;
+db.createCollection('users');
+db.users.insertOne({_id: 1, name: 'Alice', profile: {city: 'Shanghai'}, tags: ['vip', 'beta']});
+db.users.insertOne({_id: 2, name: 'Bob', active: true});
+db.users.find();
+db.users.find({name: 'Alice'});
+db.createCollection('events');
+BEGIN;
+db.events.insertOne({kind: 'pending', payload: {count: 1}});
+ROLLBACK;
+db.events.find();
+SHOW COLLECTIONS;

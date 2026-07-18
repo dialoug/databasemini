@@ -16,7 +16,7 @@
 
 namespace minidb {
 
-// 两个命令行程序共用的逐行 REPL。execute 回调决定语句进入哪一种数据库。
+// 三个命令行程序共用的逐行 REPL。execute 回调决定命令进入哪一种数据库。
 inline int run_repl(const std::string& banner,
                     const std::string& prompt,
                     const std::function<QueryResult(const std::string&)>& execute) {

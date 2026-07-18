@@ -1,4 +1,6 @@
 #include "minidb/common/sql_parser.hpp"
+#include "minidb/mongo/mongo_database.hpp"
+#include "minidb/mongo/mongo_parser.hpp"
 #include "minidb/mysql/mysql_database.hpp"
 #include "minidb/postgres/postgres_database.hpp"
 
@@ -35,6 +37,24 @@ void parser_tests() {
 
     const auto with_bom = minidb::parse_sql("\xEF\xBB\xBFSHOW ARCHITECTURE;");
     expect(with_bom.ok(), "parser accepts an optional UTF-8 BOM from Windows pipes");
+}
+
+void mongo_parser_tests() {
+    // Mongo parser 接受递归文档，而不是把文档语法塞入关系型 SQL AST。
+    const auto insert = minidb::mongo::parse_command(
+        "db.users.insertOne({_id: 1, profile: {city: 'Shanghai'}, "
+        "tags: ['vip', 'beta'], active: true});");
+    expect(insert.ok(), "Mongo parser accepts nested documents and arrays");
+    expect(insert.ok() &&
+               std::holds_alternative<minidb::mongo::InsertOneStatement>(
+                   *insert.statement),
+           "Mongo parser creates an insertOne AST node");
+
+    const auto find = minidb::mongo::parse_command("db.users.find({name: 'Alice'});");
+    expect(find.ok(), "Mongo parser accepts a top-level equality filter");
+
+    const auto invalid = minidb::mongo::parse_command("db.users.deleteMany({});");
+    expect(!invalid.ok(), "Mongo parser rejects unsupported collection methods");
 }
 
 void postgres_tests() {
@@ -141,13 +161,78 @@ void mysql_tests() {
     session->execute("COMMIT;");
 }
 
+void mongo_tests() {
+    minidb::mongo::MongoDatabase database;
+    auto session = database.connect();
+
+    expect(session->execute("db.createCollection('users');").ok,
+           "MongoDB creates a collection without a column schema");
+    expect(session->execute(
+               "db.users.insertOne({_id: 1, name: 'Alice', "
+               "profile: {city: 'Shanghai'}, tags: ['vip']});")
+               .ok,
+           "MongoDB inserts a nested BSON-style document");
+    expect(session->execute(
+               "db.users.insertOne({_id: 2, name: 'Bob', active: true});")
+               .ok,
+           "MongoDB accepts a different document shape in the same collection");
+    expect(session->execute("db.users.find();").rows.size() == 2,
+           "MongoDB find returns documents with flexible schemas");
+    expect(session->execute("db.users.find({name: 'Alice'});").rows.size() == 1,
+           "MongoDB find applies a top-level equality filter");
+    expect(!session->execute("db.users.insertOne({_id: 1, name: 'duplicate'});").ok,
+           "MongoDB enforces unique _id values");
+    expect(session->execute("db.users.insertOne({name: 'auto-id'});").ok,
+           "MongoDB generates an _id that avoids explicit identifiers");
+
+    // 事务内文档对自己可见，对其他 session 不可见，回滚后保持不可见。
+    session->execute("db.createCollection('events');");
+    auto observer = database.connect();
+    session->execute("BEGIN;");
+    expect(session->execute("db.events.insertOne({kind: 'pending'});").ok,
+           "MongoDB transaction inserts a document");
+    expect(session->execute("db.events.find();").rows.size() == 1,
+           "MongoDB transaction sees its own insert");
+    expect(observer->execute("db.events.find();").rows.empty(),
+           "MongoDB hides an uncommitted document from another session");
+    session->execute("ROLLBACK;");
+    expect(observer->execute("db.events.find();").rows.empty(),
+           "MongoDB abort hides the rolled-back document");
+
+    // 事务快照保持稳定；提交后的新查询才能看到其他 session 的提交。
+    auto reader = database.connect();
+    auto writer = database.connect();
+    reader->execute("session.startTransaction();");
+    expect(reader->execute("db.events.find();").rows.empty(),
+           "MongoDB snapshot transaction initially sees no documents");
+    writer->execute("db.events.insertOne({kind: 'committed'});");
+    expect(reader->execute("db.events.find();").rows.empty(),
+           "MongoDB transaction keeps its original snapshot");
+    reader->execute("session.commitTransaction();");
+    expect(reader->execute("db.events.find();").rows.size() == 1,
+           "MongoDB sees the committed document after its transaction ends");
+
+    // insertOne 可以隐式创建 collection；事务回滚同时撤销该教学 catalog 项。
+    session->execute("BEGIN;");
+    session->execute("db.ephemeral.insertOne({value: 1});");
+    session->execute("ROLLBACK;");
+    expect(!session->execute("db.ephemeral.find();").ok,
+           "MongoDB rollback removes an implicitly created collection in this model");
+
+    const auto architecture = session->execute("SHOW ARCHITECTURE;");
+    expect(architecture.ok && !architecture.rows.empty(),
+           "MongoDB exposes its document architecture for comparison");
+}
+
 }  // namespace
 
 int main() {
-    // 按层次执行：先验证共享 parser，再验证两套完全独立的执行/存储路径。
+    // 按层次执行：先验证 parser，再验证三套独立的执行/存储路径。
     parser_tests();
+    mongo_parser_tests();
     postgres_tests();
     mysql_tests();
+    mongo_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
