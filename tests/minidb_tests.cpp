@@ -1,4 +1,8 @@
 #include "minidb/common/sql_parser.hpp"
+#include "minidb/neo4j/cypher_parser.hpp"
+#include "minidb/neo4j/neo4j_database.hpp"
+#include "minidb/redis/redis_database.hpp"
+#include "minidb/redis/redis_parser.hpp"
 #include "minidb/mongo/mongo_database.hpp"
 #include "minidb/mongo/mongo_parser.hpp"
 #include "minidb/mysql/mysql_database.hpp"
@@ -55,6 +59,44 @@ void mongo_parser_tests() {
 
     const auto invalid = minidb::mongo::parse_command("db.users.deleteMany({});");
     expect(!invalid.ok(), "Mongo parser rejects unsupported collection methods");
+}
+
+void redis_parser_tests() {
+    const auto set = minidb::redis::parse_command("SET greeting 'hello world';");
+    expect(set.ok(), "Redis parser accepts a quoted value containing spaces");
+    expect(set.ok() &&
+               std::holds_alternative<minidb::redis::SetStatement>(*set.statement),
+           "Redis parser creates a SET AST node");
+
+    const auto keys = minidb::redis::parse_command("KEYS user:*");
+    expect(keys.ok(), "Redis parser accepts a prefix key pattern");
+
+    const auto ping = minidb::redis::parse_command("PING 'hello';");
+    expect(ping.ok() &&
+               std::holds_alternative<minidb::redis::PingStatement>(*ping.statement),
+           "Redis parser accepts PING with an optional message");
+
+    const auto invalid = minidb::redis::parse_command("GET key extra");
+    expect(!invalid.ok(), "Redis parser rejects extra command arguments");
+}
+
+void neo4j_parser_tests() {
+    const auto create = minidb::neo4j::parse_cypher(
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->"
+        "(b:Person {name: 'Bob'});");
+    expect(create.ok(), "Neo4j parser accepts a typed property-graph path");
+    expect(create.ok() &&
+               std::holds_alternative<minidb::neo4j::CreateStatement>(
+                   *create.statement),
+           "Neo4j parser creates the correct CREATE AST node");
+
+    const auto match = minidb::neo4j::parse_cypher(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r, b.name;");
+    expect(match.ok(), "Neo4j parser accepts one-hop MATCH and property projection");
+
+    const auto invalid = minidb::neo4j::parse_cypher(
+        "MATCH (a)-[:KNOWS]-(b) RETURN a, b;");
+    expect(!invalid.ok(), "Neo4j parser rejects unsupported undirected patterns");
 }
 
 void postgres_tests() {
@@ -224,15 +266,140 @@ void mongo_tests() {
            "MongoDB exposes its document architecture for comparison");
 }
 
+void redis_tests() {
+    minidb::redis::RedisDatabase database;
+    auto session = database.connect();
+
+    expect(session->execute("PING;").message == "PONG" &&
+               session->execute("PING 'hello';").message == "hello",
+           "Redis PING checks the command path and echoes an optional message");
+    expect(session->execute("SET user:1 'Alice Smith';").ok,
+           "Redis stores a string by key");
+    const auto first_get = session->execute("GET user:1;");
+    expect(first_get.ok && first_get.rows.size() == 1 &&
+               std::get<std::string>(first_get.rows.front()[1]) == "Alice Smith",
+           "Redis retrieves a value through direct key lookup");
+    expect(session->execute("TYPE user:1;").message == "string" &&
+               session->execute("TYPE missing;").message == "none" &&
+               session->execute("DBSIZE;").message == "(integer) 1",
+           "Redis TYPE and DBSIZE expose string keyspace metadata");
+    session->execute("SET user:1 Bob;");
+    const auto overwritten = session->execute("GET user:1;");
+    expect(std::get<std::string>(overwritten.rows.front()[1]) == "Bob",
+           "Redis SET overwrites the value without a row or document schema");
+    expect(session->execute("GET missing;").message == "(nil)",
+           "Redis GET reports a missing key");
+
+    expect(session->execute("INCR visits;").message == "(integer) 1" &&
+               session->execute("INCR visits;").message == "(integer) 2",
+           "Redis INCR performs an atomic integer update");
+    session->execute("SET user:2 Carol;");
+    expect(session->execute("KEYS user:*;").rows.size() == 2,
+           "Redis KEYS scans matching key names for teaching purposes");
+
+    // MULTI 只排队，EXEC 才在一个临界区内执行，其他连接看不到中间状态。
+    auto observer = database.connect();
+    expect(session->execute("MULTI;").ok, "Redis MULTI starts a command queue");
+    expect(session->execute("SET order:1 pending;").message == "QUEUED" &&
+               session->execute("GET order:1;").message == "QUEUED",
+           "Redis commands are queued instead of executed during MULTI");
+    expect(observer->execute("GET order:1;").message == "(nil)",
+           "Redis queued writes are invisible before EXEC");
+    const auto executed = session->execute("EXEC;");
+    expect(executed.ok && executed.rows.size() == 2,
+           "Redis EXEC returns one result for every queued command");
+    expect(observer->execute("GET order:1;").rows.size() == 1,
+           "Redis EXEC publishes the queued write atomically");
+
+    session->execute("MULTI;");
+    session->execute("SET discarded value;");
+    expect(session->execute("DISCARD;").ok &&
+               observer->execute("GET discarded;").message == "(nil)",
+           "Redis DISCARD drops commands that have not executed");
+
+    // Redis 风格事务不提供 SQL 式回滚：运行时错误作为结果返回，后续命令继续。
+    session->execute("SET broken not-an-integer;");
+    session->execute("MULTI;");
+    session->execute("INCR broken;");
+    session->execute("SET after:error survived;");
+    const auto partial = session->execute("EXEC;");
+    expect(partial.ok && partial.rows.size() == 2 &&
+               std::get<std::string>(partial.rows.front()[1]).starts_with("ERROR:"),
+           "Redis EXEC reports a runtime error without aborting its result list");
+    expect(session->execute("GET after:error;").rows.size() == 1,
+           "Redis runtime error does not roll back later queued commands");
+
+    expect(session->execute("DEL user:2;").message == "(integer) 1" &&
+               session->execute("EXISTS user:2;").message == "(integer) 0",
+           "Redis DEL and EXISTS operate on a single key");
+    const auto architecture = session->execute("SHOW ARCHITECTURE;");
+    expect(architecture.ok && !architecture.rows.empty(),
+           "Redis model exposes its direct lookup architecture");
+}
+
+void neo4j_tests() {
+    minidb::neo4j::Neo4jDatabase database;
+    auto session = database.connect();
+
+    expect(session->execute(
+               "CREATE (alice:Person {name: 'Alice', age: 30})-"
+               "[:KNOWS {since: 2020}]->(bob:Person {name: 'Bob'});")
+               .ok,
+           "Neo4j creates labeled nodes and a typed relationship");
+
+    const auto people = session->execute(
+        "MATCH (person:Person) RETURN person.name, person.age;");
+    expect(people.ok && people.rows.size() == 2,
+           "Neo4j MATCH scans nodes by label");
+
+    const auto traversal = session->execute(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r.since, b.name;");
+    expect(traversal.ok && traversal.rows.size() == 1 &&
+               std::get<std::string>(traversal.rows.front()[0]) == "Alice" &&
+               std::get<std::int64_t>(traversal.rows.front()[1]) == 2020 &&
+               std::get<std::string>(traversal.rows.front()[2]) == "Bob",
+           "Neo4j traverses a directed edge and projects properties");
+
+    const auto reverse = session->execute(
+        "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person) RETURN r;");
+    expect(reverse.ok && reverse.rows.empty(),
+           "Neo4j relationship direction affects traversal results");
+
+    auto observer = database.connect();
+    session->execute("BEGIN;");
+    session->execute("CREATE (:Person {name: 'Pending'});");
+    expect(session->execute(
+               "MATCH (n:Person {name: 'Pending'}) RETURN n;").rows.size() == 1,
+           "Neo4j transaction sees its own graph update");
+    expect(observer->execute(
+               "MATCH (n:Person {name: 'Pending'}) RETURN n;").rows.empty(),
+           "Neo4j hides an uncommitted node from another session");
+    session->execute("ROLLBACK;");
+    expect(observer->execute(
+               "MATCH (n:Person {name: 'Pending'}) RETURN n;").rows.empty(),
+           "Neo4j ROLLBACK discards nodes created in the transaction");
+
+    expect(session->execute("SHOW LABELS;").rows.size() == 1 &&
+               session->execute("SHOW RELATIONSHIP TYPES;").rows.size() == 1,
+           "Neo4j reports label and relationship-type metadata");
+    const auto architecture = session->execute("SHOW ARCHITECTURE;");
+    expect(architecture.ok && !architecture.rows.empty(),
+           "Neo4j model exposes its property-graph architecture");
+}
+
 }  // namespace
 
 int main() {
-    // 按层次执行：先验证 parser，再验证三套独立的执行/存储路径。
+    // 按层次执行：先验证 parser，再验证五套独立的执行/存储路径。
     parser_tests();
     mongo_parser_tests();
+    redis_parser_tests();
+    neo4j_parser_tests();
     postgres_tests();
     mysql_tests();
     mongo_tests();
+    redis_tests();
+    neo4j_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

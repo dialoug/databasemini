@@ -8,7 +8,7 @@
 namespace minidb {
 
 // 所有语句统一返回 QueryResult：既能表达简单状态，也能表达 SELECT 结果集。
-// 这相当于教学版的数据库协议响应，但没有实现三种数据库的真实网络协议。
+// 这相当于教学版的数据库协议响应，但没有实现五种数据库的真实网络协议。
 struct QueryResult {
     bool ok{true};
     std::string message;

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(database_architecture_lab
     VERSION 1.0.0
-    DESCRIPTION "Educational PostgreSQL-style, MySQL-style, and MongoDB-style mini databases"
+    DESCRIPTION "Educational relational, document, key-value, and graph mini databases"
     LANGUAGES CXX)
 
 # 默认构建测试；学习时也可以通过 -DMINIDB_BUILD_TESTS=OFF 只构建数据库程序。
@@ -22,7 +22,7 @@ function(minidb_enable_warnings target)
     endif()
 endfunction()
 
-# 共享层提供关系型值、统一结果格式和最小 SQL parser；MongoDB 只复用结果格式。
+# 共享层提供关系型值、统一结果格式和最小 SQL parser；MongoDB/Redis/Neo4j 只复用结果格式。
 # catalog、事务管理器和存储实现不共享，以便从源码结构观察架构差异。
 add_library(minidb_common
     src/common/result.cpp
@@ -59,7 +59,25 @@ target_include_directories(minidb_mongo PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(minidb_mongo PUBLIC minidb_common)
 minidb_enable_warnings(minidb_mongo)
 
-# 三个独立命令行程序用于对照关系型架构和文档型架构。
+# Redis 风格实现：string keyspace、原子 INCR 和 MULTI 命令队列。
+add_library(minidb_redis
+    src/redis/redis_parser.cpp
+    src/redis/redis_database.cpp
+)
+target_include_directories(minidb_redis PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(minidb_redis PUBLIC minidb_common)
+minidb_enable_warnings(minidb_redis)
+
+# Neo4j 风格实现：属性节点、有类型关系、单跳 Cypher MATCH 和快照事务。
+add_library(minidb_neo4j
+    src/neo4j/cypher_parser.cpp
+    src/neo4j/neo4j_database.cpp
+)
+target_include_directories(minidb_neo4j PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(minidb_neo4j PUBLIC minidb_common)
+minidb_enable_warnings(minidb_neo4j)
+
+# 五个独立命令行程序用于对照关系型、文档型、键值型和图数据库架构。
 add_executable(pg_mini apps/postgres_main.cpp)
 target_link_libraries(pg_mini PRIVATE minidb_postgres)
 minidb_enable_warnings(pg_mini)
@@ -72,11 +90,24 @@ add_executable(mongo_mini apps/mongo_main.cpp)
 target_link_libraries(mongo_mini PRIVATE minidb_mongo)
 minidb_enable_warnings(mongo_mini)
 
+add_executable(redis_mini apps/redis_main.cpp)
+target_link_libraries(redis_mini PRIVATE minidb_redis)
+minidb_enable_warnings(redis_mini)
+
+add_executable(neo4j_mini apps/neo4j_main.cpp)
+target_link_libraries(neo4j_mini PRIVATE minidb_neo4j)
+minidb_enable_warnings(neo4j_mini)
+
 if(MINIDB_BUILD_TESTS)
     # 测试框架只使用标准库，避免教学项目被第三方测试依赖掩盖。
     include(CTest)
     add_executable(minidb_tests tests/minidb_tests.cpp)
-    target_link_libraries(minidb_tests PRIVATE minidb_postgres minidb_mysql minidb_mongo)
+    target_link_libraries(minidb_tests PRIVATE
+        minidb_postgres
+        minidb_mysql
+        minidb_mongo
+        minidb_redis
+        minidb_neo4j)
     minidb_enable_warnings(minidb_tests)
     add_test(NAME minidb_tests COMMAND minidb_tests)
 endif()

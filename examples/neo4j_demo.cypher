@@ -1,0 +1,11 @@
+SHOW ARCHITECTURE;
+CREATE (alice:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(bob:Person {name: 'Bob', age: 28});
+CREATE (:Person {name: 'Carol'});
+MATCH (person:Person) RETURN person.name, person;
+MATCH (a:Person)-[relationship:KNOWS]->(b:Person) RETURN a.name, relationship, b.name;
+BEGIN;
+CREATE (:Person {name: 'Rolled Back'});
+ROLLBACK;
+MATCH (person:Person) RETURN person.name;
+SHOW LABELS;
+SHOW RELATIONSHIP TYPES;
